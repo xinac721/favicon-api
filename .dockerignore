@@ -1,0 +1,59 @@
+# Version control, local configuration, and editor metadata
+.[!.]*
+..?*
+.git/
+.github/
+.idea/
+.vscode/
+.DS_Store
+**/.DS_Store
+.env
+.env.*
+.dockerignore
+.gitignore
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Build and test artifacts
+build/
+dist/
+*.egg-info/
+*.py[cod]
+**/*.py[cod]
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+tests/
+
+# Local dependencies
+.venv/
+node_modules/
+venv/
+.pipenv/
+
+# Runtime and temporary files
+data/
+!data/
+data/*
+!data/url_blacklist.txt
+logs/
+*.tmp
+*.log
+*.lock
+
+# Files not required by the production image
+docs/
+Dockerfile
+docker-compose.yml
+nginx.conf
+requirements-dev.txt
+run.py
+startup.sh
+*.md

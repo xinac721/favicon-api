@@ -1,0 +1,6 @@
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# Run at 03:15 in the container's configured timezone. The root cron shell
+# opens Docker's output streams, then the launcher drops the updater to app.
+# 15 3 * * * root /usr/local/bin/python /app/scripts/cron_update.pyc >> /proc/1/fd/1 2>> /proc/1/fd/2

@@ -1,0 +1,87 @@
+version: 1
+disable_existing_loggers: false
+formatters:
+  default:
+    format: "[%(levelname)-7s] %(asctime)s [%(process)2d] -[%(filename)s:%(lineno)d] %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+filters:
+  gunicorn_worker_termination:
+    (): favicon_app.utils.logging_filter.GunicornWorkerTerminationFilter
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: default
+    stream: ext://sys.stdout
+  file_info:
+    class: concurrent_log_handler.ConcurrentTimedRotatingFileHandler
+    level: INFO
+    formatter: default
+    filename: logs/info.log
+    when: midnight
+    interval: 1
+    backupCount: 7
+    encoding: utf-8
+    delay: false
+  file_error:
+    class: concurrent_log_handler.ConcurrentTimedRotatingFileHandler
+    level: ERROR
+    formatter: default
+    filename: logs/error.log
+    when: midnight
+    interval: 1
+    backupCount: 7
+    encoding: utf-8
+    delay: false
+  file_request:
+    class: concurrent_log_handler.ConcurrentTimedRotatingFileHandler
+    level: INFO
+    formatter: default
+    filename: logs/req.log
+    when: midnight
+    interval: 1
+    backupCount: 7
+    encoding: utf-8
+    delay: false
+loggers:
+  uvicorn:
+    level: INFO
+    handlers:
+      - console
+      - file_info
+      - file_error
+    propagate: false
+  uvicorn.error:
+    level: INFO
+    handlers:
+      - console
+      - file_info
+      - file_error
+    propagate: false
+  uvicorn.access:
+    level: INFO
+    handlers:
+      - file_request
+    propagate: false
+  gunicorn.error:
+    level: INFO
+    handlers:
+      - console
+      - file_info
+      - file_error
+    filters:
+      - gunicorn_worker_termination
+    propagate: false
+  gunicorn.access:
+    level: INFO
+    handlers:
+      - file_request
+    propagate: false
+
+root:
+  level: INFO
+  handlers:
+    - console
+    - file_info
+    - file_error

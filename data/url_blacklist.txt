@@ -1,0 +1,5 @@
+! Title: Favicon API preloaded URL blacklist
+! Homepage: https://github.com/xinac721/favicon-api
+! Last modified: 2026-08-17 UTC
+!
+||example.cc^

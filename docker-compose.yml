@@ -1,0 +1,43 @@
+services:
+  favicon:
+    build:
+      context: ${FAVICON_BUILD_CONTEXT:-.}
+      dockerfile: Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian}
+        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian-security}
+    pull_policy: build
+    image: xinac721/favicon-api
+    container_name: favicon-api-v4
+    network_mode: bridge
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - 0.0.0.0:8000:8000
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      ALLOW_PRIVATE_NETWORK: ${ALLOW_PRIVATE_NETWORK:-false}
+    volumes:
+      - ${FAVICON_RUNTIME_ROOT:-.}/data:/app/data:rw
+      - ${FAVICON_RUNTIME_ROOT:-.}/logs:/app/logs:rw
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+    healthcheck:
+      test: ["CMD", "gosu", "app", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
