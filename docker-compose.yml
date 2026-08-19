@@ -1,0 +1,16 @@
+services:
+  favicon:
+    image: xinac721/favicon-api:latest
+    container_name: favicon-api-v3
+    ports:
+      - 8000:8000
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - /usr/share/zoneinfo/Asia/Shanghai:/usr/share/zoneinfo/Asia/Shanghai:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./data:/app/data:rw
+      - ./conf:/app/conf:rw
+      - ./logs:/app/logs:rw
+    restart: unless-stopped

@@ -1,3 +1,3 @@
 #!/usr/bin/env sh
 
-uwsgi --ini /data/wwwroot/api_favicon/uwsgi.ini
+gunicorn -c conf/gunicorn.conf.py main:app

@@ -2,28 +2,49 @@
 
 import logging
 import os
-import sys
 
-from flask import Flask
-from flask import redirect, url_for
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 
-sys.path.append(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__))
-))
+import setting
+from favicon_app.routes import favicon_router
+from favicon_app.utils.file_util import FileUtil
 
-logging.basicConfig(level=logging.INFO, format='[%(levelname)-7s] %(asctime)s -[%(filename)-10.10s:%(lineno)4d] %(message)s')
+logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+# 获取当前所在目录
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+# 站点的 favicon.ico 图标
+favicon_icon_file = setting.favicon_icon_file
+# 默认的站点图标
+default_icon_file = setting.default_icon_file
+# referer日志文件路径
+referer_log_file = setting.referer_log_file
 
-# 注册蓝图
-from applications.application import favicon_blu
-app.register_blueprint(favicon_blu)
+# fastapi
+app = FastAPI(title="Favicon API", description="获取网站favicon图标", version="3.0")
+app.include_router(favicon_router)
 
 
-# @app.route('/')
-def hello_world():
-    return redirect(url_for('index'))
+@app.middleware("http")
+async def log_referer(request: Request, call_next):
+    _referer = request.headers.get('referrer') or request.headers.get('referer')
+    if _referer:
+        FileUtil.write_file(referer_log_file, '%s\n' % _referer, mode='a')
+    response = await call_next(request)
+    return response
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False)
+@app.get("/")
+async def root():
+    return {"message": "Welcome to Favicon API! Use /icon/?url=example.com to get favicon."}
+
+
+@app.get("/favicon.ico", summary="favicon.ico", tags=["default"])
+async def favicon_ico():
+    return Response(content=favicon_icon_file, media_type="image/x-icon")
+
+
+@app.get("/favicon.png", summary="favicon.png", tags=["default"])
+async def favicon_png():
+    return Response(content=default_icon_file, media_type="image/png")

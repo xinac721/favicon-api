@@ -1,0 +1,26 @@
+# 忽略所有隐藏文件
+.*
+
+# 忽略构建产物
+dist/
+*.egg-info/
+
+# 忽略本地依赖
+node_modules/
+venv/
+.pipenv/
+
+# 忽略临时文件
+*.tmp
+*.log
+__pycache__/
+
+# 忽略指定目录
+.vscode/
+data/
+logs/
+conf/
+Dockerfile
+docker-compose.yml
+README.md
+LICENSE
