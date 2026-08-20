@@ -99,6 +99,7 @@ time_of_30_days = 30 * time_of_1_days
 FAILED_URL_EXPIRE_MIN = env_int('FAILED_URL_EXPIRE_MIN', time_of_6_hours, minimum=1)
 FAILED_URL_EXPIRE_MAX = env_int('FAILED_URL_EXPIRE_MAX', 72 * time_of_1_hours, minimum=1)
 FAILED_URL_EXPIRE_RATIO = env_float('FAILED_URL_EXPIRE_RATIO', 2, minimum=1)
+TRANSIENT_FAILED_URL_EXPIRE = env_int('TRANSIENT_FAILED_URL_EXPIRE', time_of_5_minus, minimum=1)
 NEGATIVE_MEMORY_CACHE_MAX_ITEMS = env_int('NEGATIVE_MEMORY_CACHE_MAX_ITEMS', 50000, minimum=0)
 if FAILED_URL_EXPIRE_MAX < FAILED_URL_EXPIRE_MIN:
     raise ValueError('FAILED_URL_EXPIRE_MAX must be at least FAILED_URL_EXPIRE_MIN')
@@ -131,6 +132,27 @@ FOREGROUND_RESPONSE_TIMEOUT = env_float('FOREGROUND_RESPONSE_TIMEOUT', 12, minim
 DIRECT_FETCH_TIMEOUT = env_float('DIRECT_FETCH_TIMEOUT', 10, minimum=0.001)
 FALLBACK_FETCH_TIMEOUT = env_float('FALLBACK_FETCH_TIMEOUT', 15, minimum=0.001)
 FETCH_TOTAL_TIMEOUT = env_float('FETCH_TOTAL_TIMEOUT', 75, minimum=0.001)
+PROVIDER_MAX_CONCURRENCY = env_int('PROVIDER_MAX_CONCURRENCY', 5, minimum=1)
+PROVIDER_CIRCUIT_FAILURE_THRESHOLD = env_int(
+    'PROVIDER_CIRCUIT_FAILURE_THRESHOLD',
+    5,
+    minimum=1,
+)
+PROVIDER_CIRCUIT_OPEN_SECONDS = env_float(
+    'PROVIDER_CIRCUIT_OPEN_SECONDS',
+    60,
+    minimum=0.001,
+)
+PROVIDER_CIRCUIT_MAX_OPEN_SECONDS = env_float(
+    'PROVIDER_CIRCUIT_MAX_OPEN_SECONDS',
+    1800,
+    minimum=0.001,
+)
+if PROVIDER_CIRCUIT_MAX_OPEN_SECONDS < PROVIDER_CIRCUIT_OPEN_SECONDS:
+    raise ValueError(
+        'PROVIDER_CIRCUIT_MAX_OPEN_SECONDS must be at least '
+        'PROVIDER_CIRCUIT_OPEN_SECONDS'
+    )
 REFRESH_QUEUE_MAX_SIZE = env_int('REFRESH_QUEUE_MAX_SIZE', 10000, minimum=1)
 REFRESH_WORKERS = env_int('REFRESH_WORKERS', 16, minimum=1)
 
@@ -155,6 +177,6 @@ CUSTOM_PROTOCOL_MAPPINGS = {
 FAVICON_APIS = [
     ('https://t3.gstatic.cn/faviconV2?client=SOCIAL&fallback_opts=TYPE,SIZE,URL&type=FAVICON&size=128&url={base_url}',
      'gstatic接口'),
-    ('https://favicon.im/{domain}', '第三方API'),
+    ('https://favicon.im/{domain}', 'favicon.im'),
     ('', '网站默认位置/favicon.ico'),
 ]

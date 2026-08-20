@@ -12,6 +12,10 @@ import socket
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import timezone
+from email.utils import parsedate_to_datetime
+from enum import Enum
 from typing import Optional, Tuple
 from urllib.parse import unquote_to_bytes, urljoin, urlsplit, urlunsplit
 from urllib.request import getproxies
@@ -45,6 +49,35 @@ _redirect_statuses = {301, 302, 303, 307, 308}
 
 class ResponseTooLargeError(Exception):
     pass
+
+
+class FetchOutcome(str, Enum):
+    SUCCESS = 'success'
+    MISS = 'miss'
+    TRANSIENT_ERROR = 'transient_error'
+    RATE_LIMITED = 'rate_limited'
+    PROVIDER_REJECTED = 'provider_rejected'
+    BLOCKED = 'blocked'
+    INVALID = 'invalid'
+    TOO_LARGE = 'too_large'
+
+
+@dataclass(frozen=True)
+class HTTPFetchResult:
+    content: Optional[bytes]
+    content_type: Optional[str]
+    outcome: FetchOutcome
+    status: Optional[int] = None
+    retry_after: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class IconFetchResult:
+    content: Optional[bytes]
+    content_type: Optional[str]
+    outcome: FetchOutcome
+    status: Optional[int] = None
+    retry_after: Optional[float] = None
 
 
 def _is_usable_unicast_ip(value: str) -> bool:
@@ -473,52 +506,97 @@ class Favicon:
             retries: int = DEFAULT_RETRIES,
             timeout: float = DEFAULT_TIMEOUT,
     ) -> Tuple[Optional[bytes], Optional[str]]:
+        result = await self.get_icon_file_result(
+            icon_path,
+            default,
+            retries=retries,
+            timeout=timeout,
+        )
+        return result.content, result.content_type
+
+    async def get_icon_file_result(
+            self,
+            icon_path: str,
+            default: bool = False,
+            retries: int = DEFAULT_RETRIES,
+            timeout: float = DEFAULT_TIMEOUT,
+    ) -> IconFetchResult:
         self.icon_too_large = False
         self.get_icon_url(icon_path, default)
         if not self.icon_url or not self.domain:
-            return None, None
+            return IconFetchResult(None, None, FetchOutcome.INVALID)
 
         try:
             if self.icon_url.startswith('data:image'):
                 separator_index = self.icon_url.find(',')
                 if separator_index < 0:
-                    return None, None
+                    return IconFetchResult(None, None, FetchOutcome.INVALID)
                 metadata = self.icon_url[:separator_index]
                 payload_start = separator_index + 1
                 if ';base64' in metadata.lower():
                     max_encoded_length = 4 * ((setting.MAX_ICON_BYTES + 2) // 3)
                     if len(self.icon_url) - payload_start > max_encoded_length:
                         self.icon_too_large = True
-                        return None, None
+                        return IconFetchResult(None, None, FetchOutcome.TOO_LARGE)
                     payload = self.icon_url[payload_start:]
                     content = base64.b64decode(payload, validate=True)
                 else:
                     payload = self.icon_url[payload_start:]
                     content = unquote_to_bytes(payload)
                 content_type = metadata[5:].split(';', 1)[0].lower()
+                request_result = HTTPFetchResult(
+                    content,
+                    content_type,
+                    FetchOutcome.SUCCESS,
+                )
                 if len(content) > setting.MAX_ICON_BYTES:
                     self.icon_too_large = True
-                    return None, None
+                    return IconFetchResult(None, None, FetchOutcome.TOO_LARGE)
             else:
-                content, content_type = await _req_get(
+                request_result = await _req_get_result(
                     self.icon_url,
                     retries=retries,
                     timeout=timeout,
                     max_bytes=setting.MAX_ICON_BYTES,
                 )
+                content = request_result.content
+                content_type = request_result.content_type
+                if request_result.outcome == FetchOutcome.TOO_LARGE:
+                    self.icon_too_large = True
 
             if content and helpers.is_image(content):
-                return content, filetype.guess_mime(content) or content_type
+                return IconFetchResult(
+                    content,
+                    filetype.guess_mime(content) or content_type,
+                    FetchOutcome.SUCCESS,
+                    request_result.status,
+                    request_result.retry_after,
+                )
+            if request_result.outcome != FetchOutcome.SUCCESS:
+                return IconFetchResult(
+                    None,
+                    None,
+                    request_result.outcome,
+                    request_result.status,
+                    request_result.retry_after,
+                )
         except ResponseTooLargeError:
             self.icon_too_large = True
-            return None, None
+            return IconFetchResult(None, None, FetchOutcome.TOO_LARGE)
         except Exception as exc:
             logger.warning(
                 '候选异常：%s；%s；继续下一来源',
                 _url_for_log(self.icon_url),
                 _exception_for_log(exc),
             )
-        return None, None
+            return IconFetchResult(None, None, FetchOutcome.TRANSIENT_ERROR)
+        return IconFetchResult(
+            None,
+            None,
+            FetchOutcome.INVALID,
+            request_result.status,
+            request_result.retry_after,
+        )
 
     async def req_get(
             self,
@@ -576,6 +654,42 @@ async def _req_get(
         timeout: float = DEFAULT_TIMEOUT,
         max_bytes: int = setting.MAX_ICON_BYTES,
 ) -> Tuple[Optional[bytes], Optional[str]]:
+    result = await _req_get_result(
+        url,
+        domain=domain,
+        retries=retries,
+        timeout=timeout,
+        max_bytes=max_bytes,
+    )
+    if result.outcome == FetchOutcome.TOO_LARGE:
+        raise ResponseTooLargeError
+    return result.content, result.content_type
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    candidate = value.strip()
+    try:
+        return max(0.0, float(candidate))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(candidate)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, retry_at.timestamp() - time.time())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+async def _req_get_result(
+        url: str,
+        domain: Optional[str] = None,
+        retries: int = DEFAULT_RETRIES,
+        timeout: float = DEFAULT_TIMEOUT,
+        max_bytes: int = setting.MAX_ICON_BYTES,
+) -> HTTPFetchResult:
     del domain  # Retained for compatibility with the previous internal API.
     normalized, reason = _normalize_url_with_reason(url)
     if not normalized:
@@ -584,13 +698,13 @@ async def _req_get(
             _url_for_log(url),
             _text_for_log(reason or '未知校验错误'),
         )
-        return None, None
+        return HTTPFetchResult(None, None, FetchOutcome.INVALID)
     if await blacklist_service.is_blocked(normalized):
         logger.warning(
             '出站请求被网址黑名单阻止：%s；中止候选',
             _url_for_log(normalized),
         )
-        return None, None
+        return HTTPFetchResult(None, None, FetchOutcome.BLOCKED)
 
     await initialize_http_client()
     client = _aiohttp_client
@@ -607,7 +721,7 @@ async def _req_get(
                         '出站请求被网址黑名单阻止：%s；中止候选',
                         _url_for_log(current_url),
                     )
-                    return None, None
+                    return HTTPFetchResult(None, None, FetchOutcome.BLOCKED)
                 if setting.HTTP_TRUST_ENV:
                     await _validate_proxy_destination(current_url)
                 async with semaphore:
@@ -628,7 +742,7 @@ async def _req_get(
                                     _url_for_log(current_url),
                                     setting.HTTP_MAX_REDIRECTS,
                                 )
-                                return None, None
+                                return HTTPFetchResult(None, None, FetchOutcome.INVALID)
                             location = response.headers.get('Location')
                             redirect_url = urljoin(current_url, location or '')
                             next_url, redirect_reason = _normalize_url_with_reason(redirect_url)
@@ -639,7 +753,7 @@ async def _req_get(
                                     _url_for_log(redirect_url),
                                     _text_for_log(redirect_reason or '重定向目标无效'),
                                 )
-                                return None, None
+                                return HTTPFetchResult(None, None, FetchOutcome.BLOCKED)
                             current_url = next_url
                             continue
 
@@ -649,15 +763,39 @@ async def _req_get(
                                 _url_for_log(current_url),
                                 response.status,
                             )
-                            return None, None
+                            if response.status == 429:
+                                return HTTPFetchResult(
+                                    None,
+                                    None,
+                                    FetchOutcome.RATE_LIMITED,
+                                    response.status,
+                                    _parse_retry_after(response.headers.get('Retry-After')),
+                                )
+                            if response.status in (401, 403):
+                                outcome = FetchOutcome.PROVIDER_REJECTED
+                            elif response.status in (408, 425) or response.status >= 500:
+                                outcome = FetchOutcome.TRANSIENT_ERROR
+                            else:
+                                outcome = FetchOutcome.MISS
+                            return HTTPFetchResult(None, None, outcome, response.status)
 
                         content = await _read_limited(response, max_bytes)
                         if content is None:
-                            return None, None
+                            return HTTPFetchResult(
+                                None,
+                                None,
+                                FetchOutcome.INVALID,
+                                response.status,
+                            )
                         content_type = response.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
-                        return content, content_type or None
+                        return HTTPFetchResult(
+                            content,
+                            content_type or None,
+                            FetchOutcome.SUCCESS,
+                            response.status,
+                        )
         except ResponseTooLargeError:
-            raise
+            return HTTPFetchResult(None, None, FetchOutcome.TOO_LARGE)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             if attempt >= retries:
                 logger.debug(
@@ -667,7 +805,7 @@ async def _req_get(
                 )
                 break
             await asyncio.sleep(0)
-    return None, None
+    return HTTPFetchResult(None, None, FetchOutcome.TRANSIENT_ERROR)
 
 
 async def _validate_proxy_destination(url: str) -> None:
@@ -822,6 +960,39 @@ def add_failed_url(identity: str) -> int:
     except Exception as exc:
         logger.error(
             '负缓存写入失败：%s；%s；不缓存失败结果',
+            _url_for_log(identity),
+            _exception_for_log(exc),
+        )
+    return 0
+
+
+def add_transient_failed_url(identity: str) -> int:
+    if not identity:
+        return 0
+    try:
+        existing_ttl = failed_url_ttl(identity)
+        if existing_ttl > 0:
+            return existing_ttl
+
+        path = _failure_path(identity)
+        duration = setting.TRANSIENT_FAILED_URL_EXPIRE
+        now = time.time()
+        record = json.dumps({
+            'identity': identity,
+            'created_at': now,
+            'expires_at': now + duration,
+            'ttl': duration,
+            'kind': 'transient',
+        }, ensure_ascii=True, separators=(',', ':'))
+        if FileUtil.write_file(path, record, atomic=True):
+            with _negative_memory_lock:
+                _negative_memory_cache[identity] = now + duration
+                _negative_memory_cache.move_to_end(identity)
+                _trim_negative_cache(_negative_memory_cache)
+            return duration
+    except Exception as exc:
+        logger.error(
+            '临时失败缓存写入失败：%s；%s；不缓存失败结果',
             _url_for_log(identity),
             _exception_for_log(exc),
         )

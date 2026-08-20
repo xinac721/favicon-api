@@ -32,12 +32,13 @@ _blocked_svg = b'''<svg xmlns="http://www.w3.org/2000/svg" width="128" height="1
 </svg>'''
 
 
-@dataclass
+@dataclass(frozen=True)
 class CacheItem:
     content: bytes
     modified_at: float
     checked_at: float
     is_default: bool
+    content_md5: Optional[str] = None
 
 
 @dataclass
@@ -47,6 +48,24 @@ class FetchResult:
     blocked: bool = False
 
 
+@dataclass
+class FallbackFetchResult:
+    content: Optional[bytes] = None
+    transient_failure: bool = False
+    attempted: int = 0
+    skipped: int = 0
+
+
+@dataclass
+class ProviderState:
+    semaphore: asyncio.Semaphore
+    consecutive_failures: int = 0
+    open_count: int = 0
+    open_until: float = 0.0
+    half_open_active: bool = False
+    generation: int = 0
+
+
 _memory_cache: "OrderedDict[str, CacheItem]" = OrderedDict()
 _memory_cache_bytes = 0
 _fetch_tasks: dict[str, asyncio.Task] = {}
@@ -54,6 +73,7 @@ _direct_fetch_results: dict[str, asyncio.Future] = {}
 _refresh_queue: Optional[asyncio.Queue] = None
 _refresh_pending: set[str] = set()
 _refresh_workers: list[asyncio.Task] = []
+_provider_states: dict[str, ProviderState] = {}
 
 
 def _format_seconds(value: float) -> str:
@@ -119,6 +139,8 @@ def _remove_cache_record(icon_path: str, url_path: Optional[str]) -> None:
 
 
 def _write_cache_record(cache_key: str, content: bytes, identity: str) -> bool:
+    if _is_default_icon(content):
+        return False
     icon_path = _cache_path(cache_key)
     url_path = _url_path(cache_key)
     if not FileUtil.write_file(url_path, identity, atomic=True):
@@ -158,11 +180,57 @@ default_icon_md5 = {
 default_icon_md5.discard(None)
 
 
-def _is_default_icon(content: Optional[bytes]) -> bool:
-    return bool(content) and hashlib.md5(
+def _content_md5(content: bytes) -> str:
+    return hashlib.md5(
         content,
         usedforsecurity=False,
-    ).hexdigest().lower() in default_icon_md5
+    ).hexdigest().lower()
+
+
+def _is_default_icon(
+        content: Optional[bytes],
+        content_md5: Optional[str] = None,
+) -> bool:
+    return bool(content) and (content_md5 or _content_md5(content)) in default_icon_md5
+
+
+def _is_cacheable_icon(
+        content: Optional[bytes],
+        content_md5: Optional[str] = None,
+) -> bool:
+    return bool(content) \
+        and len(content) <= setting.MAX_ICON_BYTES \
+        and helpers.is_image(content) \
+        and not _is_default_icon(content, content_md5)
+
+
+def _normalize_cached_item(item: CacheItem) -> CacheItem:
+    content_md5 = (item.content_md5 or _content_md5(item.content)).lower()
+    is_default = content_md5 in default_icon_md5
+    if is_default:
+        if item.content == setting.default_icon_file:
+            normalized_md5 = content_md5
+        else:
+            normalized_md5 = _content_md5(setting.default_icon_file)
+        if item.is_default and item.content == setting.default_icon_file \
+                and item.content_md5 == normalized_md5:
+            return item
+        return CacheItem(
+            content=setting.default_icon_file,
+            modified_at=item.modified_at,
+            checked_at=item.checked_at,
+            is_default=True,
+            content_md5=normalized_md5,
+        )
+    if item.is_default or item.content_md5 != content_md5:
+        return CacheItem(
+            content=item.content,
+            modified_at=item.modified_at,
+            checked_at=item.checked_at,
+            is_default=False,
+            content_md5=content_md5,
+        )
+    return item
 
 
 def _get_header(content_type: str, cache_time: int, cache_status: str) -> dict[str, str]:
@@ -255,7 +323,10 @@ def _read_cache_file(
             if not content or not helpers.is_image(content):
                 continue
 
-            if identity and (path != current_path or not os.path.isfile(current_url_path)):
+            content_md5 = _content_md5(content)
+            is_default = content_md5 in default_icon_md5
+            if not is_default and identity \
+                    and (path != current_path or not os.path.isfile(current_url_path)):
                 if _write_cache_record(cache_key, content, identity):
                     try:
                         os.utime(current_path, (modified_at, modified_at))
@@ -264,13 +335,13 @@ def _read_cache_file(
                     if path != current_path:
                         _remove_cache_record(path, mapping_path)
 
-            is_default = _is_default_icon(content)
-            return CacheItem(
-                content=setting.default_icon_file if is_default else content,
+            return _normalize_cached_item(CacheItem(
+                content=content,
                 modified_at=modified_at,
                 checked_at=time.time(),
                 is_default=is_default,
-            )
+                content_md5=content_md5,
+            ))
         except OSError as exc:
             logger.warning(
                 '缓存读取失败：%s；%s；忽略并重新抓取',
@@ -287,6 +358,11 @@ async def _get_cached(cache_key: str, identity: Optional[str] = None) -> Optiona
         _memory_remove(cache_key)
         await asyncio.to_thread(_remove_cache_record, _cache_path(cache_key), _url_path(cache_key))
         item = None
+    if item:
+        checked_item = _normalize_cached_item(item)
+        if checked_item is not item:
+            _memory_put(cache_key, checked_item)
+        item = checked_item
     if item and now - item.checked_at < setting.MEMORY_CACHE_RECHECK_INTERVAL:
         _memory_cache.move_to_end(cache_key)
         return item
@@ -324,6 +400,20 @@ def _memory_put(cache_key: str, item: CacheItem) -> None:
 async def _store_cache(entity: Favicon, content: bytes) -> bool:
     if not entity.domain_md5 or not entity.cache_identity:
         return False
+    if not content or len(content) > setting.MAX_ICON_BYTES \
+            or not helpers.is_image(content):
+        logger.info(
+            '缓存拒绝无效或占位图：%s；不写入内存或磁盘',
+            favicon._url_for_log(entity.cache_identity),
+        )
+        return False
+    content_md5 = _content_md5(content)
+    if _is_default_icon(content, content_md5):
+        logger.info(
+            '缓存拒绝无效或占位图：%s；不写入内存或磁盘',
+            favicon._url_for_log(entity.cache_identity),
+        )
+        return False
     persisted = await asyncio.to_thread(
             _write_cache_record,
             entity.domain_md5,
@@ -336,6 +426,7 @@ async def _store_cache(entity: Favicon, content: bytes) -> bool:
         modified_at=now,
         checked_at=now,
         is_default=False,
+        content_md5=content_md5,
     ))
     if not persisted:
         logger.warning(
@@ -487,22 +578,204 @@ async def _fetch_direct_icon(entity: Favicon, deadline: float) -> Optional[bytes
     )
 
 
-async def _fetch_fallback_icon(entity: Favicon, deadline: float) -> Optional[bytes]:
-    candidates = [
-        (
-            template.format(domain=entity.domain, base_url=entity.get_base_url()),
-            name,
-            False,
-        )
-        for template, name in setting.FAVICON_APIS
+async def _fetch_fallback_icon(entity: Favicon, deadline: float) -> FallbackFetchResult:
+    result = FallbackFetchResult()
+    providers = [
+        (f'{index}:{template}', template, name)
+        for index, (template, name) in enumerate(setting.FAVICON_APIS)
         if template
     ]
-    return await _try_icon_candidates(
-        entity,
-        candidates,
-        deadline,
-        setting.FALLBACK_FETCH_TIMEOUT,
+    loop = asyncio.get_running_loop()
+    for index, (provider_key, template, name) in enumerate(providers):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            result.transient_failure = True
+            result.skipped += len(providers) - index
+            break
+
+        try:
+            strategy_url = template.format(
+                domain=entity.domain,
+                base_url=entity.get_base_url(),
+            )
+        except (KeyError, IndexError, ValueError) as exc:
+            result.transient_failure = True
+            result.skipped += 1
+            logger.error(
+                '供应商模板无效：%s；%s；%s；下一供应商',
+                favicon._text_for_log(name, 40),
+                favicon._url_for_log(template),
+                favicon._exception_for_log(exc),
+            )
+            continue
+        state = _provider_states.get(provider_key)
+        if state is None:
+            state = ProviderState(asyncio.Semaphore(setting.PROVIDER_MAX_CONCURRENCY))
+            _provider_states[provider_key] = state
+
+        now = loop.time()
+        half_open_probe = False
+        if state.open_until > now:
+            result.transient_failure = True
+            result.skipped += 1
+            logger.debug(
+                '供应商熔断跳过：%s；%s；剩余%ss；下一供应商',
+                favicon._text_for_log(name, 40),
+                favicon._url_for_log(strategy_url),
+                _format_seconds(state.open_until - now),
+            )
+            continue
+        if state.open_until > 0:
+            if state.half_open_active:
+                result.transient_failure = True
+                result.skipped += 1
+                continue
+            state.half_open_active = True
+            half_open_probe = True
+
+        attempt_generation = state.generation
+        request_timeout = min(max(0.1, setting.FALLBACK_FETCH_TIMEOUT), remaining)
+        acquired = False
+        try:
+            async with asyncio.timeout(request_timeout):
+                await state.semaphore.acquire()
+                acquired = True
+                result.attempted += 1
+                fetch_result = await entity.get_icon_file_result(
+                    strategy_url,
+                    False,
+                    retries=0,
+                    timeout=request_timeout,
+                )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            fetch_result = favicon.IconFetchResult(
+                None,
+                None,
+                favicon.FetchOutcome.TRANSIENT_ERROR,
+            )
+            result.transient_failure = True
+            timeout_kind = '请求超时' if acquired else '并发排队超时'
+            logger.warning(
+                '供应商%s：%s；%s；限制%ss；下一供应商',
+                timeout_kind,
+                favicon._text_for_log(name, 40),
+                favicon._url_for_log(strategy_url),
+                _format_seconds(request_timeout),
+            )
+        except Exception as exc:
+            fetch_result = favicon.IconFetchResult(
+                None,
+                None,
+                favicon.FetchOutcome.TRANSIENT_ERROR,
+            )
+            result.transient_failure = True
+            logger.warning(
+                '供应商异常：%s；%s；%s；下一供应商',
+                favicon._text_for_log(name, 40),
+                favicon._url_for_log(strategy_url),
+                favicon._exception_for_log(exc),
+            )
+        finally:
+            if acquired:
+                state.semaphore.release()
+            if half_open_probe:
+                state.half_open_active = False
+
+        content = fetch_result.content
+        if _is_cacheable_icon(content):
+            _provider_succeeded(state, attempt_generation, half_open_probe)
+            result.content = content
+            logger.debug(
+                '供应商成功：%s；%s；写入缓存',
+                favicon._text_for_log(name, 40),
+                favicon._url_for_log(strategy_url),
+            )
+            return result
+
+        if _provider_outcome_is_failure(fetch_result):
+            result.transient_failure = True
+            if acquired:
+                _provider_failed(
+                    state,
+                    fetch_result.retry_after,
+                    attempt_generation,
+                    half_open_probe,
+                    immediate=fetch_result.outcome in {
+                        favicon.FetchOutcome.RATE_LIMITED,
+                        favicon.FetchOutcome.PROVIDER_REJECTED,
+                    },
+                )
+            logger.warning(
+                '供应商故障：%s；%s；结果=%s；HTTP=%s；下一供应商',
+                favicon._text_for_log(name, 40),
+                favicon._url_for_log(strategy_url),
+                fetch_result.outcome.value,
+                fetch_result.status if fetch_result.status is not None else '-',
+            )
+        else:
+            _provider_succeeded(state, attempt_generation, half_open_probe)
+            logger.debug(
+                '供应商无有效图标：%s；%s；结果=%s；下一供应商',
+                favicon._text_for_log(name, 40),
+                favicon._url_for_log(strategy_url),
+                fetch_result.outcome.value,
+            )
+    return result
+
+
+def _provider_outcome_is_failure(result: favicon.IconFetchResult) -> bool:
+    if result.outcome in {
+            favicon.FetchOutcome.TRANSIENT_ERROR,
+            favicon.FetchOutcome.RATE_LIMITED,
+            favicon.FetchOutcome.PROVIDER_REJECTED,
+            favicon.FetchOutcome.BLOCKED,
+    }:
+        return True
+    return result.outcome == favicon.FetchOutcome.INVALID and result.status is None
+
+
+def _provider_succeeded(
+        state: ProviderState,
+        generation: int,
+        half_open_probe: bool,
+) -> None:
+    if not half_open_probe and generation != state.generation:
+        return
+    state.consecutive_failures = 0
+    state.open_count = 0
+    state.open_until = 0.0
+
+
+def _provider_failed(
+        state: ProviderState,
+        retry_after: Optional[float],
+        generation: int,
+        half_open_probe: bool,
+        immediate: bool = False,
+) -> None:
+    if not half_open_probe and generation != state.generation:
+        return
+    state.consecutive_failures += 1
+    if not immediate and state.open_until <= 0 \
+            and state.consecutive_failures < setting.PROVIDER_CIRCUIT_FAILURE_THRESHOLD:
+        return
+    state.open_count += 1
+    delay = min(
+        setting.PROVIDER_CIRCUIT_MAX_OPEN_SECONDS,
+        setting.PROVIDER_CIRCUIT_OPEN_SECONDS * (
+            2 ** min(state.open_count - 1, 30)
+        ),
     )
+    if retry_after is not None:
+        delay = min(
+            setting.PROVIDER_CIRCUIT_MAX_OPEN_SECONDS,
+            max(delay, retry_after),
+        )
+    state.open_until = asyncio.get_running_loop().time() + delay
+    state.consecutive_failures = 0
+    state.generation += 1
 
 
 async def get_icon_async(
@@ -541,6 +814,8 @@ async def get_icon_async(
             content = None
         except Exception as exc:
             direct_failure_reason = favicon._exception_for_log(exc)
+            content = None
+        if content and not _is_cacheable_icon(content):
             content = None
         if content and await blacklist_service.is_blocked(entity.cache_identity):
             result = FetchResult(fallback_content, False, blocked=True)
@@ -585,7 +860,16 @@ async def get_icon_async(
         if direct_result is not None and not direct_result.done():
             direct_result.set_result(direct_failure)
 
-        content = await _fetch_fallback_icon(entity, overall_deadline)
+        fallback_result = await _fetch_fallback_icon(entity, overall_deadline)
+        if isinstance(fallback_result, FallbackFetchResult):
+            content = fallback_result.content
+            transient_failure = fallback_result.transient_failure
+        else:
+            # Internal compatibility for tests and deployments patching the old helper.
+            content = fallback_result
+            transient_failure = False
+        if content and not _is_cacheable_icon(content):
+            content = None
         if await blacklist_service.is_blocked(entity.cache_identity):
             return FetchResult(fallback_content, False, blocked=True)
         if content:
@@ -597,10 +881,16 @@ async def get_icon_async(
             )
             return FetchResult(content, True)
 
-        negative_ttl = await asyncio.to_thread(favicon.add_failed_url, entity.cache_identity)
+        failure_cache = (
+            favicon.add_transient_failed_url
+            if transient_failure
+            else favicon.add_failed_url
+        )
+        negative_ttl = await asyncio.to_thread(failure_cache, entity.cache_identity)
         retained = '保留旧图' if stale_content else '使用默认图'
         if negative_ttl > 0:
-            failure_action = f'负缓存{negative_ttl}秒，{retained}'
+            cache_kind = '临时失败缓存' if transient_failure else '负缓存'
+            failure_action = f'{cache_kind}{negative_ttl}秒，{retained}'
         else:
             failure_action = f'{retained}，后续可重试'
         logger.warning(
@@ -620,10 +910,13 @@ async def get_icon_async(
         failure = FetchResult(fallback_content, False)
         if direct_result is not None and not direct_result.done():
             direct_result.set_result(failure)
-        negative_ttl = await asyncio.to_thread(favicon.add_failed_url, entity.cache_identity)
+        negative_ttl = await asyncio.to_thread(
+            favicon.add_transient_failed_url,
+            entity.cache_identity,
+        )
         retained = '保留旧图' if stale_content else '使用默认图'
         negative_action = (
-            f'负缓存{negative_ttl}秒，{retained}'
+            f'临时失败缓存{negative_ttl}秒，{retained}'
             if negative_ttl > 0
             else retained
         )
@@ -715,6 +1008,7 @@ async def start_refresh_workers() -> None:
     global _refresh_queue
     if _refresh_queue is not None:
         return
+    _provider_states.clear()
     _refresh_queue = asyncio.Queue(maxsize=setting.REFRESH_QUEUE_MAX_SIZE)
     for _ in range(setting.REFRESH_WORKERS):
         _refresh_workers.append(asyncio.create_task(_refresh_worker()))
@@ -741,6 +1035,7 @@ async def stop_refresh_workers() -> None:
     _direct_fetch_results.clear()
     _refresh_pending.clear()
     _memory_cache.clear()
+    _provider_states.clear()
     _memory_cache_bytes = 0
     _refresh_queue = None
 
@@ -885,7 +1180,9 @@ async def get_favicon_handler(
         if fallback_cached is None:
             memory_item = _memory_cache.get(entity.domain_md5)
             if memory_item and not _is_file_expired(memory_item.modified_at):
-                fallback_cached = memory_item
+                fallback_cached = _normalize_cached_item(memory_item)
+                if fallback_cached is not memory_item:
+                    _memory_put(entity.domain_md5, fallback_cached)
         logger.exception(
             '接口异常：%s；%s；%s',
             favicon._url_for_log(entity.cache_identity),
